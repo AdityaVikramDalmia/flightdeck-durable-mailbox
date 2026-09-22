@@ -1,0 +1,356 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+export LC_ALL=C
+TOOL=mailbox
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$ROOT/lib/core.sh"
+. "$ROOT/lib/lock.sh"
+MBX_TMPF=""
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+case "${1:-}" in -h|--help|help|'') usage ;; esac
+INBOX_DIR="${MAILBOX_DIR:-}"
+if [ "${1:-}" = --dir ]; then
+  [ $# -ge 2 ] || die '--dir needs PATH'
+  INBOX_DIR="$2"; shift 2
+fi
+[ -n "$INBOX_DIR" ] || die 'specify --dir PATH or MAILBOX_DIR'
+case "$INBOX_DIR" in /*) ;; *) INBOX_DIR="$PWD/$INBOX_DIR" ;; esac
+command -v jq >/dev/null || die 'jq is required'
+KINDS="verdict ask notice recovery"
+MBX_JQ_BLOCK='
+  "── " + (.ts // "?") + " · " + (.kind // "?") + " · from " + (.from // "?")
+  + (if .to_requested then " · ⚠ RE-ADDRESSED from " + (.to_requested|tostring) else "" end)
+  + "\n" + (.body // "")
+  + (if .receipt then "\n   receipt: " + (.receipt|tostring) else "" end)
+  + "\n   id: " + (.id // "?")
+'
+
+MBX_MANIFEST_JQ='
+  (.ts // "?") + " · " + (.kind // "?") + " · from " + (.from // "?")
+  + (if .to_requested then " · ⚠ re-addressed from " + (.to_requested|tostring) else "" end)
+  + " · " + (.id // "?")
+'
+
+cmd_drain() {
+  [ $# -ge 1 ] || die "usage: drain <recipient> [--format table|json] [--dry-run] [--max N] [--max-bytes B] [--full]"
+  local recipient="$1"; shift
+  mbx_need_recipient "$recipient"; recipient="$MBX_RECIPIENT"
+  local format=table dry="" full=""
+  local max="${MAILBOX_DRAIN_MAX:-10}" maxb="${MAILBOX_DRAIN_MAX_BYTES:-16000}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --format)    [ $# -ge 2 ] || die "--format needs a value"; format="$2"; shift 2 ;;
+      --dry-run)   dry=1; shift ;;
+      --max)       [ $# -ge 2 ] || die "--max needs a count"; max="$2"; shift 2 ;;
+      --max-bytes) [ $# -ge 2 ] || die "--max-bytes needs a byte count"; maxb="$2"; shift 2 ;;
+      --full)      full=1; shift ;;
+      *) die "unknown flag '$1' (drain <recipient> [--format table|json] [--dry-run] [--max N] [--max-bytes B] [--full])" ;;
+    esac
+  done
+  [ -n "$full" ] && maxb=0
+  case "$format" in table|json) ;; *) die "bad --format '$format' (table | json)" ;; esac
+  case "$max"  in ''|*[!0-9]*) die "bad --max '$max' — a message count (0 = unlimited)" ;; esac
+  case "$maxb" in ''|*[!0-9]*) die "bad --max-bytes '$maxb' — a byte count (0 = unlimited)" ;; esac
+
+  [ "${#max}" -le 9 ] && [ "${#maxb}" -le 9 ] || die "drain limits must be at most 9 decimal digits"
+
+  mbx_ensure "$recipient"
+  local d; d="$(mbx_dir "$recipient")"
+
+  local lock="inbox-$recipient" locked=""
+  lock_acquire "$d/.drain.lock" "${MAILBOX_LOCK_WAIT_S:-10}" || return $?
+  locked=1
+
+  local -a FILES=(); local f
+  for f in "$d"/new/*.json; do [ -f "$f" ] && FILES+=("$f"); done
+
+  local -a READY=(); local bad=0 quarantine_failed=0
+  for f in ${FILES[@]+"${FILES[@]}"}; do
+    [ -f "$f" ] || continue
+    if ! mbx_envelope_valid "$f" "$recipient"; then
+      bad=$(( bad + 1 ))
+      if [ -n "$dry" ]; then mbx_warn "⚠ MALFORMED ${f##*/} — would quarantine to corrupt/"
+      elif mbx_move_unique "$f" "$d/corrupt/${f##*/}" 2>/dev/null; then
+           mbx_warn "⚠ MALFORMED ${f##*/} — quarantined to $d/corrupt/ (invalid envelope). Drain continues."
+      else quarantine_failed=$((quarantine_failed + 1)); mbx_warn "cannot verify quarantine for ${f##*/}; inspect new/ and corrupt/"
+      fi
+      continue
+    fi
+    READY+=("$f")
+  done
+
+  local -a SIZE=(); local total=0 take=0 nready="${#READY[@]}" sz i=0
+  while [ "$i" -lt "$nready" ]; do
+    sz="$(wc -c < "${READY[$i]}" 2>/dev/null | tr -d ' ')"
+    case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
+    if [ "$take" -gt 0 ]; then
+      [ "$max"  -gt 0 ] && [ "$take" -ge "$max" ] && break
+      [ "$maxb" -gt 0 ] && [ $(( total + sz )) -gt "$maxb" ] && break
+    fi
+    SIZE+=("$sz"); total=$(( total + sz )); take=$(( take + 1 )); i=$(( i + 1 ))
+  done
+  local left=$(( nready - take ))
+
+  trap '' PIPE
+  local emitted=0 stuck=0 unshown=0 rendered j=0 head_ok=1
+
+  if [ "$format" = table ]; then
+    printf 'INBOX · %s · %s message(s) · %s%s%s\n' "$recipient" "$nready" "$(mbx_utc)" \
+           "$( [ "$left" -gt 0 ] && printf ' · batch of %s, %s LEFT QUEUED' "$take" "$left" )" \
+           "$( [ -n "$dry" ] && printf ' · DRY RUN (nothing moved)' )" 2>/dev/null || head_ok=0
+    if [ "$take" -gt 0 ] && [ "$head_ok" -eq 1 ]; then
+      local mi=0
+      while IFS= read -r line; do
+        mi=$(( mi + 1 ))
+        printf '  [%s/%s] %s · %sB\n' "$mi" "$take" "$line" "${SIZE[$(( mi - 1 ))]:-?}" 2>/dev/null || head_ok=0
+      done < <(jq -r "$MBX_MANIFEST_JQ" "${READY[@]:0:$take}" 2>/dev/null)
+      echo 2>/dev/null || head_ok=0
+    fi
+  fi
+  if [ "$head_ok" -eq 0 ]; then
+    unshown="$take"; take=0
+    mbx_warn "⚠ the reader went away before any message was shown — all $unshown are STILL IN new/. Nothing was consumed unshown."
+  fi
+
+  while [ "$j" -lt "$take" ]; do
+    f="${READY[$j]}"; j=$(( j + 1 ))
+    [ -f "$f" ] || continue
+    if [ -e "$d/cur/${f##*/}" ] || [ -L "$d/cur/${f##*/}" ]; then
+      stuck=$(( stuck + 1 ))
+      mbx_warn "archive destination already exists: ${f##*/}; queued and retained copies are unchanged"
+      continue
+    fi
+    case "$(jq -r '.kind // ""' "$f" 2>/dev/null)" in
+      verdict|ask|notice|recovery) ;;
+      *) mbx_warn "⚠ ${f##*/} carries an unknown kind — delivered anyway (valid: $KINDS)" ;;
+    esac
+
+    if [ "$format" = json ]; then rendered="$(jq -c . "$f" 2>/dev/null)" || rendered=""
+    else                          rendered="$(jq -r "$MBX_JQ_BLOCK" "$f" 2>/dev/null)" || rendered=""; fi
+    if [ -z "$rendered" ]; then
+      bad=$(( bad + 1 ))
+      if [ -n "$dry" ]; then mbx_warn "⚠ UNRENDERABLE ${f##*/} — would quarantine to corrupt/"
+      elif mbx_move_unique "$f" "$d/corrupt/${f##*/}" 2>/dev/null; then
+           mbx_warn "⚠ UNRENDERABLE ${f##*/} — quarantined to $d/corrupt/ (it parses, but will not render). Drain continues."
+      else quarantine_failed=$((quarantine_failed + 1)); mbx_warn "cannot verify quarantine for ${f##*/}; inspect new/ and corrupt/"
+      fi
+      continue
+    fi
+
+    if ! { printf '%s\n' "$rendered" && { [ "$format" = json ] || echo; }; } 2>/dev/null; then
+      unshown=$(( take - j + 1 ))
+      mbx_warn "⚠ the reader went away mid-drain (write failed at ${f##*/}) — that message and the $(( unshown - 1 )) after it are STILL IN new/. Nothing was consumed unshown."
+      break
+    fi
+
+    if [ -n "$dry" ]; then emitted=$(( emitted + 1 )); continue; fi
+    if mbx_move_unique "$f" "$d/cur/${f##*/}" 2>/dev/null; then
+      emitted=$(( emitted + 1 ))
+    else
+      stuck=$(( stuck + 1 ))
+      mbx_warn "⚠ NOT CONSUMED: ${f##*/} was shown but its move to $d/cur/ could NOT be verified. Inspect new/ and cur/ before retrying; a queued copy may be shown again."
+    fi
+  done
+
+  [ -n "$locked" ] && lock_release
+
+  local queued=$(( left + stuck + unshown ))
+  if [ "$format" = table ]; then
+    if [ "$emitted" -eq 0 ] && [ "$bad" -eq 0 ] && [ "$queued" -eq 0 ]; then printf 'inbox empty.\n' 2>/dev/null || :
+    else
+      printf '%s %s%s%s%s.%s\n' "$emitted" "$( [ -n "$dry" ] && printf 'WOULD be drained' || printf 'drained' )" \
+        "$( [ "$bad"    -gt 0 ] && printf ', %s MALFORMED' "$bad" )" \
+        "$( [ "$stuck"  -gt 0 ] && printf ', %s NOT CONSUMED' "$stuck" )" \
+        "$( [ "$queued" -gt 0 ] && printf ' · %s still in new/' "$queued" )" \
+        "$( [ "$queued" -gt 0 ] && printf ' Run drain again.' )" 2>/dev/null || :
+    fi
+    if [ "$take" -gt 0 ] && [ -z "$dry" ]; then
+      printf 'bodies kept: %s/cur/<id> · jq -r .body %s/cur/<id>\n' "$d" "$d" 2>/dev/null || :
+    fi
+  elif [ "$queued" -gt 0 ]; then
+    mbx_warn "$queued message(s) still in new/ for '$recipient' — run drain again."
+  fi
+
+  if [ "$format" = table ] && [ -z "$dry" ]; then
+    local -a OPENA=(); local oa open_rows
+    open_rows="$(mbx_open_asks "$recipient")" || return 3
+    while IFS= read -r oa; do [ -n "$oa" ] && OPENA+=("$oa"); done <<< "$open_rows"
+    if [ "${#OPENA[@]}" -gt 0 ]; then
+      printf '🔴 %s ASK(S) STILL OPEN — a drained ask is an outstanding action, not a consumed message. Answer, then ack:\n' \
+        "${#OPENA[@]}" 2>/dev/null || :
+      for oa in "${OPENA[@]}"; do
+        printf '   · %s\n     ack: mailbox ack %s %s\n' "$(mbx_ask_summary "$d" "$oa")" "$recipient" "$oa" 2>/dev/null || :
+      done
+    fi
+  fi
+  trap - PIPE
+  { [ "$stuck" -eq 0 ] && [ "$unshown" -eq 0 ] && [ "$quarantine_failed" -eq 0 ]; } || return 3
+  return 0
+}
+
+mbx_open_asks() { # $1 recipient -> basenames of OPEN asks, oldest-first (glob is already sorted)
+  local d; d="$(mbx_dir "$1")"
+  local -a CUR=(); local f base
+  for f in "$d"/cur/*.json; do [ -f "$f" ] && CUR+=("$f"); done
+  [ "${#CUR[@]}" -gt 0 ] || return 0
+  for f in "${CUR[@]}"; do
+    base="${f##*/}"
+    mbx_envelope_valid "$f" "$1" || { mbx_warn "invalid archived envelope: $base"; return 3; }
+    if [ -e "$d/acted/$base" ] || [ -L "$d/acted/$base" ]; then
+      [ -f "$d/acted/$base" ] && [ ! -L "$d/acted/$base" ] || { mbx_warn "invalid acknowledgment marker: $base"; return 3; }
+      continue
+    fi
+    [ "$(jq -r '.kind // ""' "$f" 2>/dev/null)" = ask ] && printf '%s\n' "$base"
+  done
+  return 0
+}
+
+mbx_ask_summary() { # $1 inbox dir  $2 basename -> "<age> · from <who> · <first body line, trimmed>"
+  local d="$1" base="$2" f age='-' secs now from first
+  f="$d/cur/$base"
+  secs="${base:0:10}"
+  case "$secs" in
+    ''|*[!0-9]*) ;;
+    *) now="$(date -u +%s)"; [ "$now" -ge "$secs" ] && age="$(mbx_fmt_age $(( now - secs )))" ;;
+  esac
+  from="$(jq -r '.from // "?"' "$f" 2>/dev/null)" || from='?'; [ -n "$from" ] || from='?'
+  first="$(jq -r '(.body // "") | gsub("\n";" ") | .[0:100]' "$f" 2>/dev/null)" || first='?'
+  [ -n "$first" ] || first='?'
+  printf '%s · from %s · %s' "$age" "$from" "$first"
+}
+
+cmd_asks() {
+  [ $# -ge 1 ] || die "usage: asks <recipient>"
+  local recipient="$1"; shift
+  [ $# -eq 0 ] || die "asks takes only a recipient (got extra: $*)"
+  mbx_need_recipient "$recipient"; recipient="$MBX_RECIPIENT"
+  mbx_ensure "$recipient"
+  local d; d="$(mbx_dir "$recipient")"
+  local -a OPEN=(); local base open_rows
+  open_rows="$(mbx_open_asks "$recipient")" || return 3
+  while IFS= read -r base; do [ -n "$base" ] && OPEN+=("$base"); done <<< "$open_rows"
+  if [ "${#OPEN[@]}" -eq 0 ]; then printf 'no open asks for %s.\n' "$recipient"; return 0; fi
+  printf '%s OPEN ask(s) for %s — drained (read) but not yet acked:\n' "${#OPEN[@]}" "$recipient"
+  for base in "${OPEN[@]}"; do
+    printf '  · %s\n    id: %s\n' "$(mbx_ask_summary "$d" "$base")" "$base"
+  done
+  printf 'answer each, then: mailbox ack %s <id>\n' "$recipient"
+  return 0
+}
+
+cmd_ack() {
+  [ $# -ge 2 ] || die "usage: ack <recipient> <id>   (<id> is the message filename — see: mailbox asks <recipient>)"
+  local recipient="$1" id="$2"; shift 2
+  local from_override="" by_override=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from) [ $# -ge 2 ] || die "--from needs a sender name"; from_override="$2"; shift 2 ;;
+      --by)   [ $# -ge 2 ] || die "--by needs a session id";  by_override="$(mbx_norm_sid "$2" from)"; shift 2 ;;
+      *) die "unknown argument '$1' (ack <recipient> <id> [--from <name>] [--by <sid>])" ;;
+    esac
+  done
+  mbx_need_recipient "$recipient"; recipient="$MBX_RECIPIENT"
+  case "$id" in
+    '')        die "empty id — pass the message filename (see: mailbox asks $recipient)" ;;
+    [!A-Za-z0-9]*|*[!A-Za-z0-9._-]*|*..*) die "bad id '$id' — it is a message filename, not a path" ;;
+    *.json) ;;
+    *) die "message id must end in .json" ;;
+  esac
+  mbx_ensure "$recipient"
+  local d; d="$(mbx_dir "$recipient")"
+
+  if [ ! -e "$d/cur/$id" ]; then
+    if [ -e "$d/new/$id" ]; then
+      die "'$id' is still UNDRAINED (in new/) — drain it first; an ask you have not read is not one you can answer"
+    fi
+    die "no such drained message '$id' for '$recipient' (looked in cur/). List open asks: mailbox asks $recipient"
+  fi
+  mbx_envelope_valid "$d/cur/$id" "$recipient" || { mbx_warn "invalid archived envelope: $id"; return 3; }
+  local kind; kind="$(jq -r '.kind // ""' "$d/cur/$id" 2>/dev/null)" || kind=""
+  [ "$kind" = ask ] || die "'$id' is kind '${kind:-?}', not 'ask' — only asks are tracked as open, so there is nothing to ack"
+  if [ -e "$d/acted/$id" ] || [ -L "$d/acted/$id" ]; then
+    [ -f "$d/acted/$id" ] && [ ! -L "$d/acted/$id" ] || die "invalid acknowledgment marker: $id"
+    printf 'already acked: %s\n' "$id"; return 0
+  fi
+
+  local sid name
+  sid="${by_override:-$(mbx_self_sid)}"
+  name="${from_override:-${MAILBOX_FROM:-}}"
+  [ -n "$name" ] || name="${sid:-unknown}"
+
+  MBX_TMPF="$(mktemp "$d/tmp/ack.XXXXXXXX")"
+  printf '%s acked by %s\n' "$(mbx_utc_iso)" "$name" > "$MBX_TMPF"
+  mv -f "$MBX_TMPF" "$d/acted/$id"
+  MBX_TMPF=""
+  printf 'acked: %s (by %s) — no longer listed as open\n' "$id" "$name"
+  local -a REMAIN=(); local b open_rows
+  open_rows="$(mbx_open_asks "$recipient")" || return 3
+  while IFS= read -r b; do [ -n "$b" ] && REMAIN+=("$b"); done <<< "$open_rows"
+  if [ "${#REMAIN[@]}" -gt 0 ]; then
+    printf '%s ask(s) still open for %s — list: mailbox asks %s\n' "${#REMAIN[@]}" "$recipient" "$recipient"
+  else
+    printf 'no asks remain open for %s.\n' "$recipient"
+  fi
+  return 0
+}
+
+mbx_peek_one() { # $1 recipient -> one line
+  local r="$1" d n oldest age kinds base secs now dead=""
+  d="$(mbx_dir "$r")"
+  local -a FILES=(); local f
+  for f in "$d"/new/*.json; do [ -f "$f" ] && FILES+=("$f"); done
+  n="${#FILES[@]}"
+  if [ "$n" -eq 0 ]; then printf '%-18s 0 waiting%s\n' "$r" "$dead"; return 0; fi
+  kinds="$(jq -r '.kind // "?"' "${FILES[@]}" 2>/dev/null | sort | uniq -c \
+           | awk '{ printf "%s%s %s", (NR>1 ? " · " : ""), $2, $1 }')"
+  oldest="${FILES[0]}"; base="${oldest##*/}"
+  secs="${base:0:10}"; age='-'
+  case "$secs" in
+    ''|*[!0-9]*) ;;
+    *) now="$(date -u +%s)"; [ "$now" -ge "$secs" ] && age="$(mbx_fmt_age $(( now - secs )))" ;;
+  esac
+  printf '%-18s %s waiting · %s · oldest %s%s\n' "$r" "$n" "${kinds:-?}" "$age" "$dead"
+}
+
+cmd_peek() {
+  local r="${1:-}"
+  if [ -n "$r" ]; then
+    mbx_need_recipient "$r"; r="$MBX_RECIPIENT"
+    mbx_ensure "$r"; mbx_peek_one "$r"; return 0
+  fi
+  [ -d "$INBOX_DIR" ] || { printf 'no inbox yet: %s\n' "$INBOX_DIR"; return 0; }
+  local any=0 d
+  for d in "$INBOX_DIR"/*/; do
+    [ -d "$d" ] || continue
+    d="${d%/}"; any=1
+    mbx_peek_one "${d##*/}"
+  done
+  [ "$any" -eq 1 ] || printf 'no mailboxes yet under %s\n' "$INBOX_DIR"
+  return 0
+}
+
+cmd_path() {
+  local r="${1:-}"
+  if [ -z "$r" ]; then printf '%s\n' "$INBOX_DIR"; return 0; fi
+  mbx_need_recipient "$r"
+  printf '%s\n' "$(mbx_dir "$MBX_RECIPIENT")"
+}
+
+
+[ $# -ge 1 ] || usage
+sub="$1"; shift
+case "$sub" in
+  send) cmd_send "$@" ;;
+  drain) cmd_drain "$@" ;;
+  asks) cmd_asks "$@" ;;
+  ack) cmd_ack "$@" ;;
+  peek|status) [ $# -le 1 ] || die 'peek takes at most one recipient'; cmd_peek "$@" ;;
+  path) [ $# -le 1 ] || die 'path takes at most one recipient'; cmd_path "$@" ;;
+  history) cmd_history "$@" ;;
+  -h|--help|help) usage ;;
+  *) die "unknown command '$sub'" ;;
+esac
