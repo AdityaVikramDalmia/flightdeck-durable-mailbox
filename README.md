@@ -1,5 +1,11 @@
 # durable-mailbox
 
+> **Deprecated for new Claude Code integrations — 2026-09-22.** Retained as an
+> Apache-2.0 reference project. Public launch remains deferred and the repository
+> remains private. This is a maintainer status decision, not a claim that Claude
+> Code replaces every capability. No ongoing feature work or support is promised.
+> See the [messaging chronology and replacement boundary](docs/release/messaging.md).
+
 A local filesystem message queue for shell scripts. Send named recipients JSON messages, drain bounded batches, retain history, and explicitly acknowledge questions. It makes no network or model calls.
 
 Requires Bash 3.2+, jq 1.6+, and standard macOS/Linux command-line utilities. `make` runs the tests; Git is not a runtime dependency. Keep `bin/` and `lib/` together. From a checkout:
@@ -20,4 +26,11 @@ Or specify `mailbox --dir '/path with spaces/messages' ...` on each call. Recipi
 
 Sends publish a complete file through a same-filesystem rename. Drains serialize per recipient and fail on lock timeout. A drain retains every emitted body under `cur/`; output and consumption are separate operations, so interruption can cause a duplicate. The application must decide whether processing succeeded. There is no exactly-once processing guarantee and no fsync/power-loss guarantee.
 
-See [documentation](docs/README.md) for storage, limits, failure handling, and recovery. [Provenance](PROVENANCE.md) records the source revision and deliberate changes. No license is included; licensing must be settled before wider distribution.
+See [documentation](docs/README.md) for storage, limits, failure handling, and recovery. [Provenance](PROVENANCE.md) records the source revision and deliberate changes. Licensed under Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE). Repository visibility remains private.
+
+## License and maintenance
+
+Copyright 2026 Aditya Dalmia. Licensed under [Apache-2.0](LICENSE), with
+[attribution](NOTICE) and [source provenance](PROVENANCE.md). Public launch is
+deferred; repository access remains private. See the [release preparation index](docs/release/README.md),
+[contributing guide](CONTRIBUTING.md), and [security contact](SECURITY.md).
